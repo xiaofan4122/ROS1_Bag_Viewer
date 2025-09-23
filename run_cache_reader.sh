@@ -6,4 +6,4 @@ source /media/ss/Fan/ws_clion/ws_fast_LIVO/ws_livox_ros_driver/devel/setup.sh # 
 #source /home/ss/ws_ROS1_noetic/ws_livox/ws_livox/devel/setup.sh # livox_ros_driver_2
 
 # 2. 执行Python脚本, 并将所有参数传递过去
-python3 /media/ss/Fan/pycharm_project/ws_yifan_sync/rosbag_viewer.py "$@"
+python3 /media/ss/Fan/pycharm_project/ws_yifan_sync/bag_cache_reader.py "$@"
