@@ -20,7 +20,6 @@ import queue
 import struct
 
 from reprojection_viewer import ReprojectionViewer
-
 # --- 消息解析辅助函数 (整合版) ---
 
 BUILTIN_TYPES = {
@@ -136,12 +135,13 @@ class RosBagViewer(ttk.Toplevel):
         self.ui_task_executor = None
         self.is_closing = threading.Event()
         self.ui_update_queue = queue.Queue()
+        self.is_slider_dragging = False  # 新增状态变量，用于跟踪拖动状态
 
         # --- 步骤2: 立即创建UI骨架 ---
         self.title("智能 ROS Bag 查看器 (最终修复版)")
         self.geometry("1200x800")
         self.minsize(900, 700)
-        self.bold_font = font.Font(family="Helvetica", size=11, weight="bold")
+        self.bold_font = font.Font(family="Noto Sans CJK SC", size=11, weight="bold")
 
         # 创建UI组件，此时它们内部的数据为空
         self._create_widgets()
@@ -305,7 +305,7 @@ class RosBagViewer(ttk.Toplevel):
 
         # 创建时 self.topics 可能为空，没关系，后面会用 config 更新
         self.topic_combo = ttk.Combobox(topic_selection_frame, values=self.topics, state="readonly",
-                                        font=("Helvetica", 11))
+                                        font=("Noto Sans CJK SC", 11))
         if self.current_topic: self.topic_combo.set(self.current_topic)
         self.topic_combo.bind("<<ComboboxSelected>>", self.on_topic_selected)
 
@@ -325,6 +325,8 @@ class RosBagViewer(ttk.Toplevel):
         self.slider_var = tk.IntVar()
         self.slider = ttk.Scale(slider_frame, from_=1, to=1, orient="horizontal", variable=self.slider_var,
                                 command=self.on_slider_changed)
+        self.slider.bind("<ButtonPress-1>", self._on_slider_press)
+        self.slider.bind("<ButtonRelease-1>", self._on_slider_release)
         self.count_label = ttk.Label(slider_frame, text="N/A", width=15)
         self.slider_frame = slider_frame
         self.slider.config(state="disabled")
@@ -332,13 +334,23 @@ class RosBagViewer(ttk.Toplevel):
         self.paned_window = paned_window
         value_pane = ttk.Frame(paned_window, padding=(0, 10, 0, 0))
         self.value_label = ttk.Label(value_pane, text="消息内容", font=self.bold_font)
-        self.value_text = ScrolledText(value_pane, wrap="word", height=10, font=("Courier New", 10), autohide=True)
+        self.value_text = ScrolledText(value_pane, wrap="word", height=10, font=("Noto Sans CJK SC Mono", 10), autohide=True)
         self._update_text_widget(self.value_text, "等待后台索引完成...")
         paned_window.add(value_pane, weight=1)
         schema_pane = ttk.Frame(paned_window, padding=(0, 10, 0, 0))
         self.schema_label = ttk.Label(schema_pane, text="消息结构", font=self.bold_font)
-        self.schema_text = ScrolledText(schema_pane, wrap="word", height=10, font=("Courier New", 10), autohide=True)
+        self.schema_text = ScrolledText(schema_pane, wrap="word", height=10, font=("Noto Sans CJK SC Mono", 10), autohide=True)
         paned_window.add(schema_pane, weight=1)
+
+    def _on_slider_press(self, event=None):
+        """当鼠标在滚动条上按下时调用"""
+        self.is_slider_dragging = True
+
+    def _on_slider_release(self, event=None):
+        """当鼠标在滚动条上释放时调用"""
+        self.is_slider_dragging = False
+        # 释放后，立即以高质量模式更新一次最终位置
+        self.on_slider_changed(self.slider_var.get())
 
     def _configure_layout(self):
         # ... (与之前版本相同)
@@ -515,41 +527,73 @@ class RosBagViewer(ttk.Toplevel):
             self.count_label.config(text="N/A")
 
     def on_slider_changed(self, value):
-        # ... (代码与之前相同)
+        # 【已修改】
+        is_reprojection_active = self.reprojection_viewer and self.reprojection_viewer.winfo_exists() and self.reprojection_viewer.state() == 'normal'
         index = int(float(value)) - 1
         index_data = self.topic_indices.get(self.current_topic)
 
-        if index_data and 0 <= index < len(index_data):
-            try:
-                _, cache_path = self._get_cache_paths(self.current_topic)
-                offset, size = index_data[index]
-                with open(cache_path, 'rb') as f:
-                    f.seek(offset)
-                    msg_type, raw_data, timestamp = pickle.loads(f.read(size))
+        if not (index_data and 0 <= index < len(index_data)):
+            return
 
-                msg_class = roslib.message.get_message_class(msg_type)
-                if not msg_class: raise ValueError(f"无法找到消息类: {msg_type}")
-                reconstructed_msg = msg_class()
-                reconstructed_msg.deserialize(raw_data)
+        # 决定渲染质量：拖动时使用低质量，否则使用高质量
+        is_high_quality = not self.is_slider_dragging
 
-                total = len(index_data)
-                self.count_label.config(text=f"{index + 1} / {total}")
-                self._update_text_widget(self.value_text,
-                                         f"时间戳: {timestamp.to_sec():.4f}\n\n正在格式化消息...")
+        if is_reprojection_active:
+            total = len(index_data)
+            self.count_label.config(text=f"{index + 1} / {total}")
+            self._update_text_widget(self.value_text,
+                                     f"驱动反投影窗口...\n当前帧: {index + 1}\n模式: {'高质量' if is_high_quality else '预览'}")
+            self.reprojection_viewer.update_view_by_index(index, high_quality=is_high_quality)
+            if self.image_viewer and self.image_viewer.winfo_exists() and self.image_viewer.state() == 'normal':
+                self.image_viewer.update_image(index)
+            return
 
-                # --- 【核心改进 3】 格式化任务提交到UI专用池 ---
-                future = self.ui_task_executor.submit(self._format_message_in_background, reconstructed_msg, index,
-                                                      timestamp)
-                future.add_done_callback(self._on_formatting_complete)
+        # 如果反投影窗口是活动的，我们走一条“精简”的更新路径
+        if is_reprojection_active:
+            # 1. 只更新计数器标签
+            total = len(index_data)
+            self.count_label.config(text=f"{index + 1} / {total}")
 
+            # 2. 在主文本框里给一个简单的提示
+            self._update_text_widget(self.value_text, f"正在驱动反投影窗口...\n当前帧: {index + 1}")
 
-            except Exception as e:
-                self._update_text_widget(self.value_text, f"读取或重建缓存失败: {e}")
-
-        # 在 RosBagViewer.on_slider_changed 方法的末尾添加
-        if self.reprojection_viewer and self.reprojection_viewer.winfo_exists():
-            index = int(float(value)) - 1
+            # 3. 直接更新反投影窗口
             self.reprojection_viewer.update_view_by_index(index)
+
+            # （可选）如果图像查看器也开着，也同步更新
+            if self.image_viewer and self.image_viewer.winfo_exists() and self.image_viewer.state() == 'normal':
+                self.image_viewer.update_image(index)
+
+            return  # 提前结束，不再执行下面的重量级操作
+
+        # --- 如果反投影窗口未打开，则执行原有的完整流程 ---
+        try:
+            _, cache_path = self._get_cache_paths(self.current_topic)
+            offset, size = index_data[index]
+            with open(cache_path, 'rb') as f:
+                f.seek(offset)
+                msg_type, raw_data, timestamp = pickle.loads(f.read(size))
+
+            msg_class = roslib.message.get_message_class(msg_type)
+            if not msg_class: raise ValueError(f"无法找到消息类: {msg_type}")
+            reconstructed_msg = msg_class()
+            reconstructed_msg.deserialize(raw_data)
+
+            total = len(index_data)
+            self.count_label.config(text=f"{index + 1} / {total}")
+            self._update_text_widget(self.value_text,
+                                     f"时间戳: {timestamp.to_sec():.4f}\n\n正在格式化消息...")
+
+            future = self.ui_task_executor.submit(self._format_message_in_background, reconstructed_msg, index,
+                                                  timestamp)
+            future.add_done_callback(self._on_formatting_complete)
+
+        except Exception as e:
+            self._update_text_widget(self.value_text, f"读取或重建缓存失败: {e}")
+
+        # 如果图像查看器窗口存在且可见，则通知它更新
+        if self.image_viewer and self.image_viewer.winfo_exists() and self.image_viewer.state() == 'normal':
+            self.image_viewer.update_image(index)
 
     def _format_message_in_background(self, msg, index, t):
         """
@@ -719,14 +763,14 @@ class Launcher(ttk.Toplevel): # <--- 继承 Toplevel
         main_frame = ttk.Frame(self, padding=20)
         main_frame.pack(fill="both", expand=True)
 
-        ttk.Label(main_frame, text="选择最近使用的文件，或浏览新文件：", font=("-size 12")).pack(anchor="w")
+        ttk.Label(main_frame, text="选择最近使用的文件，或浏览新文件：", font=("Noto Sans CJK SC", 12)).pack(anchor="w")
 
         # --- 历史记录下拉框 ---
         combo_frame = ttk.Frame(main_frame)
         combo_frame.pack(fill="x", expand=True, pady=10)
 
         self.history_combo = ttk.Combobox(combo_frame, textvariable=self.selected_file_path, values=self.history,
-                                          font=("-size 10"))
+                                          font=("Noto Sans CJK SC", 10))
         self.history_combo.pack(side="left", fill="x", expand=True)
         self.history_combo.bind("<<ComboboxSelected>>", self._on_validate_selection)
         self.history_combo.bind("<KeyRelease>", self._on_validate_selection)  # 文本变化时也验证
