@@ -5,6 +5,8 @@ from tkinter import filedialog, simpledialog
 import psutil
 import ttkbootstrap as ttk
 from ttkbootstrap.scrolled import ScrolledText
+from ttkbootstrap.dialogs import Messagebox
+# --- 新增结束 ---
 import rospy
 import rosbag
 import threading
@@ -20,6 +22,7 @@ import queue
 import struct
 
 from reprojection_viewer import ReprojectionViewer
+from DataPlotter import DataPlotter
 # --- 消息解析辅助函数 (整合版) ---
 
 BUILTIN_TYPES = {
@@ -270,6 +273,30 @@ class RosBagViewer(ttk.Toplevel):
         if current_index >= 0:
             self.reprojection_viewer.update_view_by_index(current_index)
 
+    def _open_data_plotter(self):
+        """
+        启动并配置通用数据显示绘图窗口。
+        """
+        # 检查窗口是否已存在，如果存在则置于顶层
+        if hasattr(self, 'data_plotter') and self.data_plotter and self.data_plotter.winfo_exists():
+            self.data_plotter.lift()
+            return
+
+        # 检查是否已加载bag文件
+        if not self.bag_file_path:
+            Messagebox.show_warning("请先加载一个 Bag 文件。", "操作失败")
+            return
+
+        # 创建并配置绘图器实例
+        try:
+            self.data_plotter = DataPlotter(self.master)
+            self.data_plotter.configure_data_sources(
+                self.bag_file_path,
+                self.topics  # 假设 self.topics 是从bag中读取的所有话题列表
+            )
+        except Exception as e:
+            Messagebox.show_error(f"打开绘图器失败: {e}", "错误")
+
     def _auto_detect_topics(self):
         """
         根据消息类型和命名习惯，自动检测最可能的图像和激光雷达话题。
@@ -310,8 +337,8 @@ class RosBagViewer(ttk.Toplevel):
         self.topic_combo.bind("<<ComboboxSelected>>", self.on_topic_selected)
 
         # --- 将所有功能按钮都创建好 ---
-        # self.visualize_button = ttk.Button(self.topic_selection_frame, text="可视化",
-        #                                    command=self._open_image_viewer, bootstyle="info")
+        self.visualize_button = ttk.Button(self.topic_selection_frame, text="通用绘图器",
+                                           command=self._open_data_plotter, bootstyle="info")
         self.reproject_button = ttk.Button(self.topic_selection_frame, text="反投影分析",
                                            command=self._open_reprojection_viewer, bootstyle="success")
 
@@ -362,7 +389,7 @@ class RosBagViewer(ttk.Toplevel):
         self.topic_label.pack(side="left", padx=(0, 10))
         self.topic_combo.pack(side="left", fill="x", expand=True)
         self.reproject_button.pack(side="left", padx=(10, 0))
-        # self.visualize_button.pack(side="left", padx=(5, 0))
+        self.visualize_button.pack(side="left", padx=(5, 0))
         self.status_label.pack(fill="x", expand=True, pady=(5, 0))
         self.progress_frame.pack(fill="x", expand=True, pady=(5, 0))
         self.progress_label.pack(side="left", padx=(0, 10))
@@ -394,18 +421,28 @@ class RosBagViewer(ttk.Toplevel):
             os.path.join(self.CACHE_DIR, f"{base_name}.cache")
 
     def _ui_poller(self):
-        """【核心改进 3】 定期从队列中取出所有更新并智能地处理"""
-        # 一次性取出队列中所有积压的更新
+        """
+        【已修改】定期从队列中取出更新，并处理特殊的 SHUTDOWN_COMPLETE 指令。
+        """
         updates = {}
+        # 循环直到队列为空
         while not self.ui_update_queue.empty():
             try:
                 topic_name, status = self.ui_update_queue.get_nowait()
-                # 如果同一个topic有多个更新，只保留最新的一个
+
+                # 【核心修改】检查是否是关闭指令
+                if topic_name == "SHUTDOWN_COMPLETE":
+                    print("主线程收到关闭指令，正在销毁根窗口...")
+                    # 销毁主应用程序的根窗口，这将终止 mainloop 并结束程序。
+                    self.master.destroy()
+                    return  # 立即返回，因为GUI即将不存在
+
+                # 如果是常规更新，则保留最新的一个
                 updates[topic_name] = status
             except queue.Empty:
-                break
+                break  # 队列已处理完毕
 
-        # 应用这些最新的更新
+        # 应用常规状态更新
         for topic_name, status in updates.items():
             self._update_topic_status(topic_name, status)
 
@@ -701,16 +738,27 @@ class RosBagViewer(ttk.Toplevel):
         shutdown_thread.start()
 
     def _shutdown_worker(self):
+        """
+        【已修改】在后台线程中安全地关闭所有非GUI资源。
+        完成后，通过队列通知主线程来销毁GUI。
+        """
         print("正在关闭UI任务线程池...")
-        self.ui_task_executor.shutdown(wait=True)
+        if self.ui_task_executor:
+            self.ui_task_executor.shutdown(wait=True)
+
         print("正在关闭索引任务线程池...")
-        self.indexing_executor.shutdown(wait=True)
+        if self.indexing_executor:
+            self.indexing_executor.shutdown(wait=True)
 
         print("所有后台任务已完成。")
         with self.bag_lock:
-            if hasattr(self, 'bag'): self.bag.close()
-        self.after(0, self.destroy)
+            if self.bag:
+                self.bag.close()
+                print("Bag 文件已关闭。")
 
+        # 【核心修改】不再直接调用 after()。
+        # 而是向主线程的轮询器发送一个明确的指令。
+        self.ui_update_queue.put(("SHUTDOWN_COMPLETE", None))
 import tkinter as tk
 from tkinter import filedialog, messagebox, font
 import ttkbootstrap as ttk
