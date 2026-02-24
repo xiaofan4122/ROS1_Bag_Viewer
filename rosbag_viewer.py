@@ -16,13 +16,16 @@ import os
 import hashlib
 import re
 import concurrent.futures
-import roslib.message
+import genpy.dynamic
 import time
 import queue
 import struct
 
-from reprojection_viewer import ReprojectionViewer
-from DataPlotter import DataPlotter
+# --- 增加这些导入 ---
+from plugin_core import ViewerContext
+from plugins.reprojection_plugin import ReprojectionPlugin
+from plugins.data_plotter_plugin import DataPlotterPlugin # 如果你写好了也取消注释
+from plugins.voxel_test_plugin import VoxelTestPlugin
 # --- 消息解析辅助函数 (整合版) ---
 
 BUILTIN_TYPES = {
@@ -125,7 +128,6 @@ class RosBagViewer(ttk.Toplevel):
         # --- 步骤1: 只进行最基础的变量初始化 ---
         self.bag_file_path = os.path.abspath(bag_file)
         self.image_viewer = None
-        self.reprojection_viewer = None  # 为反投影查看器预留引用
         self.current_topic = None
         self.topic_indices = {}
         self.topic_status = {}
@@ -139,6 +141,16 @@ class RosBagViewer(ttk.Toplevel):
         self.is_closing = threading.Event()
         self.ui_update_queue = queue.Queue()
         self.is_slider_dragging = False  # 新增状态变量，用于跟踪拖动状态
+        self._msg_def_cache = {}  # (topic, msg_type) -> msg_def
+        self._dynamic_class_cache = {}  # msg_type -> class
+
+        # --- 新增：初始化插件系统 ---
+        self.context = ViewerContext(self)
+        self.plugins = [
+            ReprojectionPlugin(self.context),
+            DataPlotterPlugin(self.context),
+            VoxelTestPlugin(self.context)
+        ]
 
         # --- 步骤2: 立即创建UI骨架 ---
         self.title("智能 ROS Bag 查看器 (最终修复版)")
@@ -213,113 +225,6 @@ class RosBagViewer(ttk.Toplevel):
     #     if self.topic_status.get(self.current_topic) == "已完成":
     #         self.on_slider_changed(self.slider_var.get())
 
-    def _open_reprojection_viewer(self):
-        """
-        【已修改】启动并配置反投影分析窗口，增加了自动检测逻辑。
-        """
-        if self.reprojection_viewer and self.reprojection_viewer.winfo_exists():
-            self.reprojection_viewer.lift()
-            return
-
-        # --- 1. 自动查找标定文件 ---
-        calib_path = ""
-        # 约定：标定文件名与bag文件名相同，扩展名为.yaml
-        expected_calib_path = os.path.splitext(self.bag_file_path)[0] + ".yaml"
-        if os.path.exists(expected_calib_path):
-            calib_path = expected_calib_path
-            print(f"自动找到标定文件: {calib_path}")
-        else:
-            # 如果找不到，才弹窗询问
-            calib_path = filedialog.askopenfilename(
-                title="未找到同名标定文件，请手动选择",
-                filetypes=[("YAML files", "*.yaml")]
-            )
-        if not calib_path: return
-
-        try:
-            with open(calib_path, 'r') as f:
-                calib = yaml.safe_load(f)
-            K = np.array(calib['camera_matrix']['data']).reshape(3, 3)
-            dist = np.array(calib['distortion_coefficients']['data'])
-            T_cam_lidar = np.array(calib['T_cam_lidar']['data']).reshape(4, 4)
-        except Exception as e:
-            messagebox.showerror("标定文件错误", f"解析标定文件失败: {e}");
-            return
-
-        # --- 2. 自动检测话题 ---
-        image_topic, lidar_topic = self._auto_detect_topics()
-
-        # --- 3. 如果检测失败，则弹窗询问 ---
-        if not image_topic:
-            image_topic = simpledialog.askstring("选择话题", "未能自动检测到图像话题，请输入:",
-                                                 initialvalue=self.current_topic)
-        if not image_topic or image_topic not in self.topics:
-            messagebox.showwarning("取消", "无效的图像话题名。");
-            return
-
-        if not lidar_topic:
-            lidar_topic = simpledialog.askstring("选择话题", "未能自动检测到点云话题，请输入:")
-        if not lidar_topic or lidar_topic not in self.topics:
-            messagebox.showwarning("取消", "无效的点云话题名。");
-            return
-
-        # --- 4. 创建并配置查看器 ---
-        self.reprojection_viewer = ReprojectionViewer(self.master)
-        self.reprojection_viewer.configure_data_sources(
-            self.bag_file_path, image_topic, lidar_topic, K, T_cam_lidar, dist
-        )
-
-        current_index = self.slider_var.get() - 1
-        if current_index >= 0:
-            self.reprojection_viewer.update_view_by_index(current_index)
-
-    def _open_data_plotter(self):
-        """
-        启动并配置通用数据显示绘图窗口。
-        """
-        # 检查窗口是否已存在，如果存在则置于顶层
-        if hasattr(self, 'data_plotter') and self.data_plotter and self.data_plotter.winfo_exists():
-            self.data_plotter.lift()
-            return
-
-        # 检查是否已加载bag文件
-        if not self.bag_file_path:
-            Messagebox.show_warning("请先加载一个 Bag 文件。", "操作失败")
-            return
-
-        # 创建并配置绘图器实例
-        try:
-            self.data_plotter = DataPlotter(self.master)
-            self.data_plotter.configure_data_sources(
-                self.bag_file_path,
-                self.topics  # 假设 self.topics 是从bag中读取的所有话题列表
-            )
-        except Exception as e:
-            Messagebox.show_error(f"打开绘图器失败: {e}", "错误")
-
-    def _auto_detect_topics(self):
-        """
-        根据消息类型和命名习惯，自动检测最可能的图像和激光雷达话题。
-        """
-        image_candidates = []
-        lidar_candidates = []
-
-        for topic_name, info in self.topic_info.items():
-            msg_type = info.msg_type
-            # 图像话题检测
-            if msg_type in ["sensor_msgs/Image", "sensor_msgs/CompressedImage"]:
-                image_candidates.append(topic_name)
-            # 点云话题检测 (可以根据您的实际类型扩展)
-            elif "PointCloud2" in msg_type or "livox" in msg_type or "lidar" in topic_name:
-                lidar_candidates.append(topic_name)
-
-        # 简单的启发式规则：选择列表中的第一个作为最佳候选
-        # 更复杂的规则可以基于名称中的关键字进行排序
-        best_image = image_candidates[0] if image_candidates else None
-        best_lidar = lidar_candidates[0] if lidar_candidates else None
-
-        return best_image, best_lidar
-
     def _create_widgets(self):
         main_frame = ttk.Frame(self, padding=(15, 15));
         self.main_frame = main_frame
@@ -336,11 +241,16 @@ class RosBagViewer(ttk.Toplevel):
         if self.current_topic: self.topic_combo.set(self.current_topic)
         self.topic_combo.bind("<<ComboboxSelected>>", self.on_topic_selected)
 
-        # --- 将所有功能按钮都创建好 ---
-        self.visualize_button = ttk.Button(self.topic_selection_frame, text="通用绘图器",
-                                           command=self._open_data_plotter, bootstyle="info")
-        self.reproject_button = ttk.Button(self.topic_selection_frame, text="反投影分析",
-                                           command=self._open_reprojection_viewer, bootstyle="success")
+
+        # 改为动态生成插件按钮：
+        for plugin in self.plugins:
+            btn = ttk.Button(
+                self.topic_selection_frame, 
+                text=plugin.get_name(), 
+                command=plugin.on_start, 
+                bootstyle=plugin.get_button_style()
+            )
+            btn.pack(side="left", padx=(10, 0))
 
         self.status_label = ttk.Label(top_frame, text="状态: 初始化...", anchor="w")
         # ... (其余创建代码不变)
@@ -354,6 +264,8 @@ class RosBagViewer(ttk.Toplevel):
                                 command=self.on_slider_changed)
         self.slider.bind("<ButtonPress-1>", self._on_slider_press)
         self.slider.bind("<ButtonRelease-1>", self._on_slider_release)
+        self.prev_btn = ttk.Button(slider_frame, text="<<", command=self._prev_frame, width=3, bootstyle="outline")
+        self.next_btn = ttk.Button(slider_frame, text=">>", command=self._next_frame, width=3, bootstyle="outline")
         self.count_label = ttk.Label(slider_frame, text="N/A", width=15)
         self.slider_frame = slider_frame
         self.slider.config(state="disabled")
@@ -379,6 +291,19 @@ class RosBagViewer(ttk.Toplevel):
         # 释放后，立即以高质量模式更新一次最终位置
         self.on_slider_changed(self.slider_var.get())
 
+    def _next_frame(self):
+        current = int(self.slider_var.get())
+        max_val = int(self.slider.cget("to"))
+        if current < max_val:
+            self.slider_var.set(current + 1)
+            self.on_slider_changed(current + 1)
+
+    def _prev_frame(self):
+        current = int(self.slider_var.get())
+        if current > 1:
+            self.slider_var.set(current - 1)
+            self.on_slider_changed(current - 1)
+
     def _configure_layout(self):
         # ... (与之前版本相同)
         self.main_frame.pack(fill="both", expand=True)
@@ -388,15 +313,15 @@ class RosBagViewer(ttk.Toplevel):
         self.topic_selection_frame.pack(fill="x", expand=True, pady=5)
         self.topic_label.pack(side="left", padx=(0, 10))
         self.topic_combo.pack(side="left", fill="x", expand=True)
-        self.reproject_button.pack(side="left", padx=(10, 0))
-        self.visualize_button.pack(side="left", padx=(5, 0))
         self.status_label.pack(fill="x", expand=True, pady=(5, 0))
         self.progress_frame.pack(fill="x", expand=True, pady=(5, 0))
         self.progress_label.pack(side="left", padx=(0, 10))
         self.progress_bar.pack(side="left", fill="x", expand=True)
         self.slider_frame.pack(fill="x", expand=True, pady=(5, 0))
         self.slider_label.pack(side="left", padx=(0, 10))
+        self.prev_btn.pack(side="left", padx=(0, 5))
         self.slider.pack(side="left", fill="x", expand=True)
+        self.next_btn.pack(side="left", padx=(5, 10))
         self.count_label.pack(side="left", padx=(10, 0))
         self.paned_window.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
         self.value_label.pack(side="top", anchor="w")
@@ -564,46 +489,28 @@ class RosBagViewer(ttk.Toplevel):
             self.count_label.config(text="N/A")
 
     def on_slider_changed(self, value):
-        # 【已修改】
-        is_reprojection_active = self.reprojection_viewer and self.reprojection_viewer.winfo_exists() and self.reprojection_viewer.state() == 'normal'
         index = int(float(value)) - 1
         index_data = self.topic_indices.get(self.current_topic)
 
         if not (index_data and 0 <= index < len(index_data)):
             return
 
-        # 决定渲染质量：拖动时使用低质量，否则使用高质量
         is_high_quality = not self.is_slider_dragging
+        total = len(index_data)
+        
+        # --- 插件事件广播 ---
+        intercepted = False
+        for plugin in self.plugins:
+            if plugin.on_frame_changed(index, is_high_quality):
+                intercepted = True
 
-        if is_reprojection_active:
-            total = len(index_data)
+        # 如果有插件接管了当前的高性能渲染（比如反投影插件正在工作），则主界面只做简单UI更新
+        if intercepted:
             self.count_label.config(text=f"{index + 1} / {total}")
-            self._update_text_widget(self.value_text,
-                                     f"驱动反投影窗口...\n当前帧: {index + 1}\n模式: {'高质量' if is_high_quality else '预览'}")
-            self.reprojection_viewer.update_view_by_index(index, high_quality=is_high_quality)
-            if self.image_viewer and self.image_viewer.winfo_exists() and self.image_viewer.state() == 'normal':
-                self.image_viewer.update_image(index)
-            return
+            self._update_text_widget(self.value_text, f"插件正在接管渲染...\n当前帧: {index + 1}\n模式: {'高质量' if is_high_quality else '预览'}")
+            return  # 提前结束，跳过后续耗时的 pickle 读取和字符串格式化
 
-        # 如果反投影窗口是活动的，我们走一条“精简”的更新路径
-        if is_reprojection_active:
-            # 1. 只更新计数器标签
-            total = len(index_data)
-            self.count_label.config(text=f"{index + 1} / {total}")
-
-            # 2. 在主文本框里给一个简单的提示
-            self._update_text_widget(self.value_text, f"正在驱动反投影窗口...\n当前帧: {index + 1}")
-
-            # 3. 直接更新反投影窗口
-            self.reprojection_viewer.update_view_by_index(index)
-
-            # （可选）如果图像查看器也开着，也同步更新
-            if self.image_viewer and self.image_viewer.winfo_exists() and self.image_viewer.state() == 'normal':
-                self.image_viewer.update_image(index)
-
-            return  # 提前结束，不再执行下面的重量级操作
-
-        # --- 如果反投影窗口未打开，则执行原有的完整流程 ---
+        # --- 如果没有插件接管，则执行默认的完整格式化流程 ---
         try:
             _, cache_path = self._get_cache_paths(self.current_topic)
             offset, size = index_data[index]
@@ -611,26 +518,16 @@ class RosBagViewer(ttk.Toplevel):
                 f.seek(offset)
                 msg_type, raw_data, timestamp = pickle.loads(f.read(size))
 
-            msg_class = roslib.message.get_message_class(msg_type)
-            if not msg_class: raise ValueError(f"无法找到消息类: {msg_type}")
-            reconstructed_msg = msg_class()
-            reconstructed_msg.deserialize(raw_data)
+            reconstructed_msg = self._deserialize_raw_message(msg_type, raw_data, self.current_topic)
 
-            total = len(index_data)
             self.count_label.config(text=f"{index + 1} / {total}")
-            self._update_text_widget(self.value_text,
-                                     f"时间戳: {timestamp.to_sec():.4f}\n\n正在格式化消息...")
+            self._update_text_widget(self.value_text, f"时间戳: {timestamp.to_sec():.4f}\n\n正在格式化消息...")
 
-            future = self.ui_task_executor.submit(self._format_message_in_background, reconstructed_msg, index,
-                                                  timestamp)
+            future = self.ui_task_executor.submit(self._format_message_in_background, reconstructed_msg, index, timestamp)
             future.add_done_callback(self._on_formatting_complete)
 
         except Exception as e:
             self._update_text_widget(self.value_text, f"读取或重建缓存失败: {e}")
-
-        # 如果图像查看器窗口存在且可见，则通知它更新
-        if self.image_viewer and self.image_viewer.winfo_exists() and self.image_viewer.state() == 'normal':
-            self.image_viewer.update_image(index)
 
     def _format_message_in_background(self, msg, index, t):
         """
@@ -718,6 +615,34 @@ class RosBagViewer(ttk.Toplevel):
         except Exception as e:
             self._update_text_widget(self.schema_text, f"无法获取结构信息.\n\nError: {e}")
 
+    def _get_msg_def_for_topic(self, topic_name, msg_type):
+        key = (topic_name, msg_type)
+        if key in self._msg_def_cache:
+            return self._msg_def_cache[key]
+        with self.bag_lock:
+            connections = self.bag._get_connections(topics=[topic_name])
+            for conn in connections:
+                if conn.datatype == msg_type:
+                    self._msg_def_cache[key] = conn.msg_def
+                    return conn.msg_def
+        raise ValueError(f"无法获取消息定义: topic={topic_name}, type={msg_type}")
+
+    def _get_dynamic_msg_class(self, msg_type, topic_name):
+        if msg_type in self._dynamic_class_cache:
+            return self._dynamic_class_cache[msg_type]
+        msg_def = self._get_msg_def_for_topic(topic_name, msg_type)
+        generated = genpy.dynamic.generate_dynamic(msg_type, msg_def)
+        msg_class = generated.get(msg_type)
+        if not msg_class:
+            raise ValueError(f"动态生成消息类失败: {msg_type}")
+        self._dynamic_class_cache[msg_type] = msg_class
+        return msg_class
+
+    def _deserialize_raw_message(self, msg_type, raw_data, topic_name):
+        msg_class = self._get_dynamic_msg_class(msg_type, topic_name)
+        msg = msg_class()
+        msg.deserialize(raw_data)
+        return msg
     def _update_text_widget(self, widget, content):
         # ... (与之前版本相同)
         widget.text.config(state="normal");
@@ -909,4 +834,3 @@ if __name__ == '__main__':
         root.mainloop()
     except Exception as e:
         messagebox.showerror("严重错误", f"程序启动失败:\n\n{e}")
-
