@@ -2,4 +2,4 @@
 .rosbag_cache
 .vscode
 *.pyc
-history.json
+*.json
