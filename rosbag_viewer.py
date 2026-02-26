@@ -24,8 +24,9 @@ import struct
 # --- 增加这些导入 ---
 from plugin_core import ViewerContext
 from plugins.reprojection_plugin import ReprojectionPlugin
-from plugins.data_plotter_plugin import DataPlotterPlugin # 如果你写好了也取消注释
+from plugins.data_plotter_plugin import DataPlotterPlugin
 from plugins.voxel_test_plugin import VoxelTestPlugin
+from plugins.imu_lidar_conflict_plugin import ImuLidarConflictPlugin
 # --- 消息解析辅助函数 (整合版) ---
 
 BUILTIN_TYPES = {
@@ -149,7 +150,8 @@ class RosBagViewer(ttk.Toplevel):
         self.plugins = [
             ReprojectionPlugin(self.context),
             DataPlotterPlugin(self.context),
-            VoxelTestPlugin(self.context)
+            VoxelTestPlugin(self.context),
+            # ImuLidarConflictPlugin(self.context)
         ]
 
         # --- 步骤2: 立即创建UI骨架 ---

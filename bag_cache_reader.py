@@ -91,6 +91,30 @@ class BagCacheReader:
         """
         return len(self.current_topic_index)
 
+    def get_msg_def(self, topic_name: str):
+        """从 bag 文件读取指定话题的消息类型和定义，用于动态生成消息类。
+        :return: (msg_type: str, msg_def: str)
+        """
+        with rosbag.Bag(self.bag_file_path, 'r') as bag:
+            for conn in bag._get_connections(topics=[topic_name]):
+                return conn.datatype, conn.msg_def
+        raise ValueError(f"找不到话题 '{topic_name}' 的消息定义")
+
+    def get_raw(self, index: int):
+        """
+        直接返回缓存中的原始数据，跳过消息反序列化，速度最快。
+        :return: (msg_type: str, raw_data: bytes, timestamp)
+        """
+        if self.current_topic is None:
+            raise RuntimeError("请在使用 get_raw 之前先调用 load_topic()。")
+        if not 0 <= index < len(self.current_topic_index):
+            raise IndexError(f"索引 {index} 越界。")
+        offset, size = self.current_topic_index[index]
+        with open(self.current_cache_path, 'rb') as f:
+            f.seek(offset)
+            msg_type, raw_data, timestamp = pickle.loads(f.read(size))
+        return msg_type, raw_data, timestamp
+
     def get_message(self, index: int):
         """
         获取指定索引位置的ROS消息对象。
