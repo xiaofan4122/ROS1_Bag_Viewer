@@ -228,9 +228,12 @@ class ReprojectionViewer(ttk.Toplevel):
         self.reprojection_panel = None
         self.ax_3d = None
         self.canvas_3d = None
-        # [新增] 导出按钮的状态
         self.export_button = None
-
+        self._slider_var = None
+        self._slider = None
+        self._frame_label = None
+        self._total_frames = 0
+        self._is_dragging = False
 
         self._create_widgets()
 
@@ -254,19 +257,59 @@ class ReprojectionViewer(ttk.Toplevel):
         self.canvas_3d = FigureCanvasTkAgg(self.fig_3d, master=self.plot_frame)
         self.canvas_3d.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.canvas_3d.mpl_connect('scroll_event', self._on_3d_scroll)
+        self.canvas_3d.mpl_connect('motion_notify_event', lambda e: self.canvas_3d.draw_idle() if e.button == 1 else None)
 
-        # --- [修改] 在此区域增加导出按钮 ---
+        # 右键菜单
+        self._context_menu = tk.Menu(self, tearoff=0)
+        self._context_menu.add_command(label="保存当前帧图像", command=self._save_current_image)
+        self._context_menu.add_command(label="保存当前帧点云 (.pcd)", command=self._save_current_pcd)
+        self._context_menu.add_separator()
+        self._context_menu.add_command(label="导出全部帧为视频", command=self.export_video)
+        # 只在反投影图像面板和3D视图上绑定右键
+        self.reprojection_panel.canvas.bind("<Button-3>", self._show_context_menu)
+        self.canvas_3d.get_tk_widget().bind("<Button-3>", self._show_context_menu)
+
+        # --- 底部控制栏：滚动条 + 帧号 + 导出按钮 ---
         self.reprojection_controls = ttk.Frame(self.reprojection_frame)
         self.reprojection_controls.pack(side=tk.BOTTOM, fill=tk.X, pady=(5, 0))
-        ttk.Label(self.reprojection_controls, text="功能").pack(side=tk.LEFT)
+
+        self._frame_label = ttk.Label(self.reprojection_controls, text="0 / 0", width=12)
+        self._frame_label.pack(side=tk.RIGHT, padx=(0, 4))
+
+        self._slider_var = tk.IntVar(value=0)
+        self._slider = ttk.Scale(
+            self.reprojection_controls, from_=0, to=0,
+            orient=tk.HORIZONTAL, variable=self._slider_var,
+            command=self._on_slider_changed
+        )
+        self._slider.bind("<ButtonPress-1>", lambda e: setattr(self, '_is_dragging', True))
+        self._slider.bind("<ButtonRelease-1>", self._on_slider_release)
+        self._slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+
+        self.bind("<Left>", self._on_key)
+        self.bind("<Right>", self._on_key)
+
         self.export_button = ttk.Button(
             self.reprojection_controls,
             text="导出视频",
             command=self.export_video,
             bootstyle="success"
         )
-        self.export_button.pack(side=tk.LEFT, padx=10)
-        # --- 新增结束 ---
+        self.export_button.pack(side=tk.RIGHT, padx=(0, 4))
+
+        # 相机帧偏移量
+        ttk.Label(self.reprojection_controls, text="相机偏移:").pack(side=tk.RIGHT, padx=(8, 2))
+        self._offset_var = tk.IntVar(value=0)
+        offset_spin = ttk.Spinbox(
+            self.reprojection_controls, from_=-9999, to=9999, width=6,
+            textvariable=self._offset_var, command=self._on_offset_changed
+        )
+        offset_spin.bind("<Return>", lambda e: self._on_offset_changed())
+        offset_spin.pack(side=tk.RIGHT, padx=(0, 4))
+
+        # 时间戳显示行
+        self._ts_label = ttk.Label(self.reprojection_frame, text="相机: --  |  LiDAR: --", foreground="gray")
+        self._ts_label.pack(side=tk.BOTTOM, anchor='w', padx=4, pady=(0, 2))
 
         right_pane.add(self.plot_frame, weight=1)
 
@@ -286,9 +329,95 @@ class ReprojectionViewer(ttk.Toplevel):
             self.dist_coeffs = dist_coeffs
             self.T_cam_lidar = T_cam_lidar
 
+            # 设置滚动条范围
+            self._total_frames = self.image_reader.get_message_count()
+            if self._total_frames > 0:
+                self._slider.config(from_=0, to=self._total_frames - 1)
+                self._frame_label.config(text=f"1 / {self._total_frames}")
+
             print("数据源配置成功！")
         except Exception as e:
             messagebox.showerror("配置失败", f"配置数据源时出错: {e}")
+
+    def _on_slider_changed(self, value):
+        index = int(float(value))
+        self._frame_label.config(text=f"{index + 1} / {self._total_frames}")
+        # 拖动时只更新帧号，不触发渲染，松开时由 _on_slider_release 统一处理
+        if not self._is_dragging:
+            self.update_view_by_index(index, high_quality=True)
+
+    def _on_slider_release(self, _event):
+        self._is_dragging = False
+        index = int(self._slider_var.get())
+        self.update_view_by_index(index, high_quality=True)
+
+    def _on_key(self, event):
+        if self._total_frames == 0:
+            return
+        index = int(self._slider_var.get())
+        if event.keysym == 'Left':
+            index = max(0, index - 1)
+        elif event.keysym == 'Right':
+            index = min(self._total_frames - 1, index + 1)
+        else:
+            return
+        self._slider_var.set(index)
+        self._frame_label.config(text=f"{index + 1} / {self._total_frames}")
+        self.update_view_by_index(index, high_quality=True)
+
+    def _on_offset_changed(self):
+        index = int(self._slider_var.get())
+        self.update_view_by_index(index, high_quality=True)
+
+    def _show_context_menu(self, event):
+        self._context_menu.post(event.x_root, event.y_root)
+        self._context_menu.grab_release()
+        self.bind("<Button-1>", lambda e: self._context_menu.unpost(), add="+")
+
+    def _save_current_image(self):
+        if self.reprojection_panel._pil_image is None:
+            messagebox.showwarning("提示", "当前没有可保存的图像喵～")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg")],
+            title="保存当前帧图像"
+        )
+        if not path:
+            return
+        self.reprojection_panel._pil_image.save(path)
+        messagebox.showinfo("完成", f"图像已保存到:\n{path}")
+
+    def _save_current_pcd(self):
+        index = int(self._slider_var.get())
+        if not self.lidar_reader:
+            messagebox.showwarning("提示", "数据源未配置喵～")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".pcd",
+            filetypes=[("PCD files", "*.pcd")],
+            title="保存当前帧点云"
+        )
+        if not path:
+            return
+        try:
+            lidar_msg, _ = self.lidar_reader.get_message(index)
+            if hasattr(lidar_msg, 'points'):
+                pts = np.array([[p.x, p.y, p.z] for p in lidar_msg.points], dtype=np.float32)
+            else:
+                import sensor_msgs.point_cloud2 as pc2
+                pts = np.array(list(pc2.read_points(lidar_msg, field_names=("x", "y", "z"), skip_nans=True)), dtype=np.float32)
+            n = len(pts)
+            with open(path, 'w') as f:
+                f.write("# .PCD v0.7 - Point Cloud Data\n")
+                f.write("VERSION 0.7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\n")
+                f.write(f"WIDTH {n}\nHEIGHT 1\nVIEWPOINT 0 0 0 1 0 0 0\n")
+                f.write(f"POINTS {n}\nDATA ascii\n")
+                for p in pts:
+                    f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f}\n")
+            messagebox.showinfo("完成", f"点云已保存到:\n{path}")
+        except Exception as e:
+            messagebox.showerror("错误", f"保存点云失败: {e}")
 
     def compressed_img_to_cv2(self, msg):
         """将 sensor_msgs/CompressedImage 转换为 cv2 图像"""
@@ -303,14 +432,28 @@ class ReprojectionViewer(ttk.Toplevel):
             return None
 
         try:
-            image_msg, _ = self.image_reader.get_message(index)
+            offset = self._offset_var.get() if hasattr(self, '_offset_var') else 0
+            img_count = self.image_reader.get_message_count()
+            image_index = max(0, min(img_count - 1, index + offset))
+
+            image_msg, img_ts = self.image_reader.get_message(image_index)
             if image_msg._type == 'sensor_msgs/CompressedImage':
                 cv_image = self.compressed_img_to_cv2(image_msg)
             else:
                 cv_image = self.image_reader.bridge.imgmsg_to_cv2(image_msg, desired_encoding="bgr8")
 
-            lidar_msg, _ = self.lidar_reader.get_message(index)
+            lidar_msg, lidar_ts = self.lidar_reader.get_message(index)
             points_lidar = np.array([[p.x, p.y, p.z] for p in lidar_msg.points])
+
+            # 更新时间戳显示
+            def fmt_ts(ts):
+                try:
+                    return f"{ts.to_sec():.6f}s"
+                except Exception:
+                    return str(ts)
+            self._ts_label.config(
+                text=f"相机(+{offset}帧): {fmt_ts(img_ts)}  |  LiDAR: {fmt_ts(lidar_ts)}  |  差值: {(img_ts - lidar_ts).to_sec()*1000:.1f}ms"
+            )
 
             # 更新所有面板，并捕获返回的反投影图像
             self._update_original_image(cv_image)
@@ -412,27 +555,21 @@ class ReprojectionViewer(ttk.Toplevel):
         # 将生成的图像返回
         return reprojection_img
 
-    def _update_3d_view(self, points_lidar, high_quality: bool = True):  # <-- 增加 high_quality 参数
+    def _update_3d_view(self, points_lidar, high_quality: bool = True):
         self.ax_3d.clear()
 
-        # --- 【核心】动态细节层次 (LOD) ---
-        points_to_render = points_lidar
-        point_size = 1
-        if not high_quality:
-        # 如果是低质量预览模式，则进行降采样（每10个点取1个）
-            downsample_rate = 10
-            if len(points_lidar) > downsample_rate:
-                points_to_render = points_lidar[::downsample_rate, :]
-            point_size = 0.5  # 预览时点可以画小一点
+        # 降采样：高质量最多 3000 点，预览最多 800 点
+        max_pts = 3000 if high_quality else 800
+        if points_lidar is not None and len(points_lidar) > max_pts:
+            step = len(points_lidar) // max_pts
+            points_to_render = points_lidar[::step, :]
+        else:
+            points_to_render = points_lidar
+        point_size = 1 if high_quality else 0.5
 
         if points_to_render is not None and len(points_to_render) > 0:
             self.ax_3d.scatter(points_to_render[:, 0], points_to_render[:, 1], points_to_render[:, 2],
                                s=point_size, c=points_to_render[:, 2], cmap='viridis', alpha=0.5)
-
-        # 绘制点云
-        if points_to_render is not None and len(points_to_render) > 0:
-            self.ax_3d.scatter(points_to_render[:, 0], points_to_render[:, 1], points_to_render[:, 2], s=1, c=points_to_render[:, 2],
-                               cmap='viridis', alpha=0.5)
 
         # ... (绘制雷达原点和相机视锥的代码与上一版本完全相同)
         T_lidar_cam = np.linalg.inv(self.T_cam_lidar)
@@ -480,7 +617,7 @@ class ReprojectionViewer(ttk.Toplevel):
         self.ax_3d.set_yticklabels([]);
         self.ax_3d.set_zticklabels([])
 
-        self.canvas_3d.draw()
+        self.canvas_3d.draw_idle()
 
     def _on_3d_scroll(self, event):
         scale_factor = 0.9 if event.button == 'up' else 1.1

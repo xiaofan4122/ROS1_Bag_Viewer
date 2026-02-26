@@ -4,6 +4,8 @@ import pickle
 import hashlib
 import re
 import roslib.message
+import genpy.dynamic
+import rosbag
 from cv_bridge import CvBridge  # 仍然需要它来处理图像消息
 
 
@@ -38,6 +40,7 @@ class BagCacheReader:
         self.current_topic = None
         self.current_topic_index = []
         self.current_cache_path = None
+        self._dynamic_class_cache = {}  # msg_type -> class
 
     def _get_cache_paths(self, topic_name: str) -> (str, str):
         """根据bag文件和topic名生成确定性的缓存文件路径"""
@@ -111,7 +114,20 @@ class BagCacheReader:
 
             msg_class = roslib.message.get_message_class(msg_type)
             if not msg_class:
-                raise ValueError(f"无法找到消息类: {msg_type}")
+                # fallback：从 bag 文件中读取消息定义，动态生成类
+                if msg_type not in self._dynamic_class_cache:
+                    with rosbag.Bag(self.bag_file_path, 'r') as bag:
+                        for topic, info in bag.get_type_and_topic_info().topics.items():
+                            if info.msg_type == msg_type:
+                                connections = bag._get_connections(topics=[topic])
+                                conn = next(connections, None)
+                                if conn:
+                                    generated = genpy.dynamic.generate_dynamic(msg_type, conn.msg_def)
+                                    self._dynamic_class_cache[msg_type] = generated.get(msg_type)
+                                    break
+                msg_class = self._dynamic_class_cache.get(msg_type)
+                if not msg_class:
+                    raise ValueError(f"无法找到消息类: {msg_type}")
 
             reconstructed_msg = msg_class()
             reconstructed_msg.deserialize(raw_data)
