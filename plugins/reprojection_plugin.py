@@ -148,7 +148,7 @@ class CalibrationDialog(tk.Toplevel):
         if not sel:
             return
         name = self._listbox.get(sel[0])
-        if messagebox.askyesno("确认删除", f"确定要删除配置 '{name}' 吗？"):
+        if messagebox.askyesno("确认删除", f"确定要删除配置 '{name}' 吗？", parent=self):
             self._history.pop(name, None)
             self._save_history()
             self._listbox.delete(sel[0])
@@ -165,14 +165,14 @@ class CalibrationDialog(tk.Toplevel):
     def _on_ok(self):
         name = self._name_var.get().strip()
         if not name:
-            messagebox.showwarning("提示", "配置名称不能为空，请先填写名称喵～")
+            messagebox.showwarning("提示", "配置名称不能为空，请先填写名称喵～", parent=self)
             return
         try:
             k_vals = self._parse_floats(self._k_var.get(), 9, "内参矩阵 K")
             dist_vals = self._parse_floats(self._dist_var.get(), 5, "畸变系数")
             t_vals = self._parse_floats(self._t_var.get(), 16, "外参矩阵 T_cam_lidar")
         except ValueError as e:
-            messagebox.showerror("输入错误", str(e))
+            messagebox.showerror("输入错误", str(e), parent=self)
             return
 
         K = np.array(k_vals).reshape(3, 3)
@@ -238,7 +238,7 @@ class ReprojectionPlugin(RosBagPluginBase):
 
         img_topic, lidar_topic = self._auto_detect_topics()
         if not img_topic or not lidar_topic:
-            messagebox.showwarning("提示", "未能自动检测到完整的图像/点云话题。")
+            messagebox.showwarning("提示", "未能自动检测到完整的图像/点云话题。", parent=self.context.master)
             return
 
         bag_path = self.context.bag_file_path

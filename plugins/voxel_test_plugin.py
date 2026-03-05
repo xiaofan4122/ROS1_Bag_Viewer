@@ -324,19 +324,19 @@ class VoxelTestWindow(ttk.Toplevel):
 
     def _jump_to_frame(self):
         if not self.index_data or len(self.index_data) == 0:
-            messagebox.showwarning("提示", "当前没有可跳转的帧。")
+            messagebox.showwarning("提示", "当前没有可跳转的帧。", parent=self)
             return
         raw = self.jump_var.get().strip()
         if not raw:
-            messagebox.showwarning("提示", "请输入要跳转的帧号。")
+            messagebox.showwarning("提示", "请输入要跳转的帧号。", parent=self)
             return
         try:
             target = int(raw)
         except ValueError:
-            messagebox.showwarning("提示", "帧号必须是整数。")
+            messagebox.showwarning("提示", "帧号必须是整数。", parent=self)
             return
         if target < 1 or target > len(self.index_data):
-            messagebox.showwarning("提示", f"帧号超出范围 (1-{len(self.index_data)})。")
+            messagebox.showwarning("提示", f"帧号超出范围 (1-{len(self.index_data)})。", parent=self)
             return
         self.current_index = target - 1
         self._load_and_update()
@@ -465,7 +465,7 @@ class VoxelTestWindow(ttk.Toplevel):
 
     def _show_point_cloud(self):
         if self.points is None or len(self.points) == 0:
-            messagebox.showwarning("提示", "当前帧没有点云可显示。")
+            messagebox.showwarning("提示", "当前帧没有点云可显示。", parent=self)
             return
         try:
             points = np.asarray(self.points)
@@ -475,25 +475,25 @@ class VoxelTestWindow(ttk.Toplevel):
             proc = mp.Process(target=_open_point_cloud_window_process, args=(tmp_path,), daemon=True)
             proc.start()
         except Exception as e:
-            messagebox.showerror("错误", f"显示点云失败: {e}")
+            messagebox.showerror("错误", f"显示点云失败: {e}", parent=self)
 
     def _start_target_scan(self):
         if self._target_task_running:
             return
         if not self.index_data or len(self.index_data) == 0:
-            messagebox.showwarning("提示", "当前没有可计算的帧。")
+            messagebox.showwarning("提示", "当前没有可计算的帧。", parent=self)
             return
         raw = self.target_var.get().strip() if hasattr(self, "target_var") else ""
         if not raw:
-            messagebox.showwarning("提示", "请输入目标点数 N。")
+            messagebox.showwarning("提示", "请输入目标点数 N。", parent=self)
             return
         try:
             target_n = int(raw)
         except ValueError:
-            messagebox.showwarning("提示", "目标点数必须是整数。")
+            messagebox.showwarning("提示", "目标点数必须是整数。", parent=self)
             return
         if target_n <= 0:
-            messagebox.showwarning("提示", "目标点数必须大于 0。")
+            messagebox.showwarning("提示", "目标点数必须大于 0。", parent=self)
             return
 
         self._target_task_running = True
@@ -504,19 +504,19 @@ class VoxelTestWindow(ttk.Toplevel):
         if self._fixed_task_running:
             return
         if not self.index_data or len(self.index_data) == 0:
-            messagebox.showwarning("提示", "当前没有可计算的帧。")
+            messagebox.showwarning("提示", "当前没有可计算的帧。", parent=self)
             return
         raw = self.fixed_voxel_var.get().strip() if hasattr(self, "fixed_voxel_var") else ""
         if not raw:
-            messagebox.showwarning("提示", "请输入体素大小 v。")
+            messagebox.showwarning("提示", "请输入体素大小 v。", parent=self)
             return
         try:
             voxel_size = float(raw)
         except ValueError:
-            messagebox.showwarning("提示", "体素大小必须是数字。")
+            messagebox.showwarning("提示", "体素大小必须是数字。", parent=self)
             return
         if voxel_size <= 0:
-            messagebox.showwarning("提示", "体素大小必须大于 0。")
+            messagebox.showwarning("提示", "体素大小必须大于 0。", parent=self)
             return
 
         self._fixed_task_running = True
@@ -621,7 +621,7 @@ class VoxelTestWindow(ttk.Toplevel):
         if self._multires_task_running:
             return
         if not self.index_data or len(self.index_data) == 0:
-            messagebox.showwarning("提示", "当前没有可计算的帧。")
+            messagebox.showwarning("提示", "当前没有可计算的帧。", parent=self)
             return
         self._multires_task_running = True
         self._update_show_btn_state()
@@ -677,7 +677,7 @@ class VoxelTestWindow(ttk.Toplevel):
         if self._adaptive_multires_task_running:
             return
         if not self.index_data or len(self.index_data) == 0:
-            messagebox.showwarning("提示", "当前没有可计算的帧。")
+            messagebox.showwarning("提示", "当前没有可计算的帧。", parent=self)
             return
         self._adaptive_multires_task_running = True
         self._update_show_btn_state()
@@ -731,7 +731,7 @@ class VoxelTestWindow(ttk.Toplevel):
         if self._adaptive_single_task_running:
             return
         if not self.index_data or len(self.index_data) == 0:
-            messagebox.showwarning("提示", "当前没有可计算的帧。")
+            messagebox.showwarning("提示", "当前没有可计算的帧。", parent=self)
             return
         self._adaptive_single_task_running = True
         self._update_show_btn_state()
@@ -978,6 +978,14 @@ class VoxelTestWindow(ttk.Toplevel):
         self.canvas.get_tk_widget().bind("<Button-3>", self._on_plot_right_click)
 
     def _on_plot_right_click(self, event):
+        # 记录右键点击时鼠标所在的 axes
+        self._right_click_ax = None
+        x_fig = event.x / self.canvas.get_tk_widget().winfo_width()
+        y_fig = 1.0 - event.y / self.canvas.get_tk_widget().winfo_height()
+        for ax in self.fig.axes:
+            if ax.get_position().contains(x_fig, y_fig):
+                self._right_click_ax = ax
+                break
         try:
             self._plot_menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -987,10 +995,11 @@ class VoxelTestWindow(ttk.Toplevel):
         try:
             from tkinter import filedialog
         except Exception:
-            messagebox.showerror("错误", "无法打开文件对话框。")
+            messagebox.showerror("错误", "无法打开文件对话框。", parent=self)
             return
 
         file_path = filedialog.asksaveasfilename(
+            parent=self,
             title="保存曲线数据",
             defaultextension=".csv",
             filetypes=[("CSV files", "*.csv")]
@@ -1000,7 +1009,8 @@ class VoxelTestWindow(ttk.Toplevel):
 
         try:
             lines = []
-            for ax in self.fig.axes:
+            target_axes = [self._right_click_ax] if getattr(self, "_right_click_ax", None) is not None else self.fig.axes
+            for ax in target_axes:
                 for line in ax.lines:
                     x = line.get_xdata()
                     y = line.get_ydata()
@@ -1008,7 +1018,7 @@ class VoxelTestWindow(ttk.Toplevel):
                     lines.append((label, x, y))
 
             if not lines:
-                messagebox.showwarning("提示", "当前没有可保存的曲线数据。")
+                messagebox.showwarning("提示", "当前没有可保存的曲线数据。", parent=self)
                 return
 
             max_len = max(len(x) for _, x, _ in lines)
@@ -1026,9 +1036,9 @@ class VoxelTestWindow(ttk.Toplevel):
                         row.append(str(y[idx]) if idx < len(y) else "")
                     f.write(",".join(row) + "\n")
 
-            messagebox.showinfo("完成", f"已保存曲线数据到:\n{file_path}")
+            messagebox.showinfo("完成", f"已保存曲线数据到:\n{file_path}", parent=self)
         except Exception as e:
-            messagebox.showerror("错误", f"保存失败: {e}")
+            messagebox.showerror("错误", f"保存失败: {e}", parent=self)
 
     def _get_or_create_annot(self, ax):
         annot = self._hover_annots.get(ax)
@@ -1247,37 +1257,75 @@ class VoxelTestPlugin(RosBagPluginBase):
     def get_button_style(self) -> str:
         return "warning"
 
+    def _ask_user_select_topic(self, available_topics):
+        """弹出选择框，让用户从多个可用点云话题中选一个，返回选中话题名或 None。"""
+        dialog = tk.Toplevel(self.context.master)
+        dialog.title("选择点云话题")
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        tk.Label(dialog, text="检测到多个可用点云话题，请选择一个：", padx=12, pady=8).pack()
+
+        selected = tk.StringVar(value=available_topics[0])
+        for t in available_topics:
+            tk.Radiobutton(dialog, text=t, variable=selected, value=t, anchor="w", padx=16).pack(fill="x")
+
+        result = [None]
+
+        def on_ok():
+            result[0] = selected.get()
+            dialog.destroy()
+
+        def on_cancel():
+            dialog.destroy()
+
+        btn_frame = tk.Frame(dialog)
+        btn_frame.pack(pady=8)
+        tk.Button(btn_frame, text="确定", width=10, command=on_ok).pack(side="left", padx=6)
+        tk.Button(btn_frame, text="取消", width=10, command=on_cancel).pack(side="left", padx=6)
+
+        dialog.wait_window()
+        return result[0]
+
     def on_start(self):
         print("VoxelTestPlugin.on_start called")  # 调试输出
         if self.test_window and self.test_window.winfo_exists():
             self.test_window.lift()
             return
 
-        topic = self.context.get_current_topic()
-        index = self.context.get_current_index()
-
-        print(f"Current topic: {topic}, index: {index}")  # 调试输出
-
-        if not topic:
-            messagebox.showwarning("警告", "请先选择一个话题。")
-            return
-
-        info = self.context.topic_info.get(topic)
         supported_types = ["sensor_msgs/PointCloud2", "livox_ros_driver2/CustomMsg", "livox_ros_driver/CustomMsg"]
-        if not info or info.msg_type not in supported_types:
-            # 列出所有支持的点云话题
-            available_topics = [t for t, i in self.context.topic_info.items() if i.msg_type in supported_types]
-            if available_topics:
-                topic_list = "\n".join(available_topics)
-                messagebox.showwarning("警告", f"当前话题 '{topic}' 不支持。该插件仅支持以下点云话题：\n{topic_list}\n请先选择其中一个点云话题。")
-            else:
-                messagebox.showwarning("警告", "该插件仅支持 sensor_msgs/PointCloud2、livox_ros_driver2/CustomMsg 和 livox_ros_driver/CustomMsg 类型的话题，但包中没有此类话题。")
+        available_topics = [t for t, i in self.context.topic_info.items() if i.msg_type in supported_types]
+
+        if not available_topics:
+            messagebox.showwarning("警告", "该插件仅支持 sensor_msgs/PointCloud2、livox_ros_driver2/CustomMsg 和 livox_ros_driver/CustomMsg 类型的话题，但包中没有此类话题。", parent=self.context.master)
             return
+
+        # 当前选中话题是否可用
+        current_topic = self.context.get_current_topic()
+        current_info = self.context.topic_info.get(current_topic) if current_topic else None
+
+        if current_info and current_info.msg_type in supported_types:
+            # 当前话题可用，直接使用
+            topic = current_topic
+        elif len(available_topics) == 1:
+            # 只有一个可用话题，自动选择
+            topic = available_topics[0]
+        else:
+            # 多个可用话题，弹窗让用户选择
+            topic = self._ask_user_select_topic(available_topics)
+            if not topic:
+                return
+
+        index = self.context.get_current_index()
+        print(f"Selected topic: {topic}, index: {index}")  # 调试输出
 
         viewer = self.context._viewer
         index_data = viewer.topic_indices.get(topic)
         if not index_data or index < 0 or index >= len(index_data):
-            messagebox.showwarning("警告", "无法获取当前帧的数据，请确保索引已完成。")
+            # 如果当前帧索引不合法（如话题被自动切换），默认取第 0 帧
+            index = 0
+        if not index_data:
+            messagebox.showwarning("警告", f"话题 '{topic}' 尚无索引数据，请确保索引已完成。", parent=self.context.master)
             return
 
         try:
