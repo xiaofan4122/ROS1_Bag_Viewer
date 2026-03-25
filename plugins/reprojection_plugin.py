@@ -4,6 +4,7 @@ import json
 import numpy as np
 import tkinter as tk
 from tkinter import messagebox
+from tkinter import ttk
 from plugin_core import RosBagPluginBase
 from reprojection_viewer import ReprojectionViewer
 
@@ -196,6 +197,67 @@ class CalibrationDialog(tk.Toplevel):
         self.destroy()
 
 
+class TopicSelectionDialog(tk.Toplevel):
+    """图像/点云话题选择对话框"""
+
+    def __init__(self, parent, image_topics, lidar_topics, default_image=None, default_lidar=None):
+        super().__init__(parent)
+        self.title("选择数据话题")
+        self.resizable(False, False)
+        self.result = None
+
+        self._image_topics = image_topics
+        self._lidar_topics = lidar_topics
+        self._image_var = tk.StringVar(value=default_image or (image_topics[0] if image_topics else ""))
+        self._lidar_var = tk.StringVar(value=default_lidar or (lidar_topics[0] if lidar_topics else ""))
+
+        self._build_ui()
+        self.grab_set()
+        self.wait_window()
+
+    def _build_ui(self):
+        frame = tk.Frame(self, padx=12, pady=10)
+        frame.pack(fill="both", expand=True)
+
+        tk.Label(frame, text="图像话题 (RGB)", font=("", 9, "bold")).grid(row=0, column=0, sticky="w")
+        img_combo = ttk.Combobox(
+            frame, state="readonly", width=64, textvariable=self._image_var, values=self._image_topics
+        )
+        img_combo.grid(row=1, column=0, sticky="ew", pady=(2, 10))
+
+        tk.Label(frame, text="点云话题 (LiDAR)", font=("", 9, "bold")).grid(row=2, column=0, sticky="w")
+        lidar_combo = ttk.Combobox(
+            frame, state="readonly", width=64, textvariable=self._lidar_var, values=self._lidar_topics
+        )
+        lidar_combo.grid(row=3, column=0, sticky="ew", pady=(2, 12))
+
+        tk.Label(
+            frame,
+            text="建议选择 D435 的 /camera/color/image_raw，而不是 depth 话题。",
+            fg="gray",
+        ).grid(row=4, column=0, sticky="w", pady=(0, 10))
+
+        button_row = tk.Frame(frame)
+        button_row.grid(row=5, column=0, sticky="e")
+        tk.Button(button_row, text="取消", command=self.destroy).pack(side="right", padx=(6, 0))
+        tk.Button(button_row, text="确认", bg="#4CAF50", fg="white", command=self._on_ok).pack(side="right")
+
+        frame.columnconfigure(0, weight=1)
+        if self._image_topics:
+            img_combo.current(max(0, self._image_topics.index(self._image_var.get())))
+        if self._lidar_topics:
+            lidar_combo.current(max(0, self._lidar_topics.index(self._lidar_var.get())))
+
+    def _on_ok(self):
+        image_topic = self._image_var.get().strip()
+        lidar_topic = self._lidar_var.get().strip()
+        if not image_topic or not lidar_topic:
+            messagebox.showwarning("提示", "请先选择图像和点云话题。", parent=self)
+            return
+        self.result = (image_topic, lidar_topic)
+        self.destroy()
+
+
 # ====================================================================== #
 #  插件主体
 # ====================================================================== #
@@ -210,7 +272,7 @@ class ReprojectionPlugin(RosBagPluginBase):
     def get_button_style(self) -> str:
         return "success"
 
-    def _auto_detect_topics(self):
+    def _collect_candidate_topics(self):
         image_candidates = []
         lidar_candidates = []
         for topic_name, info in self.context.topic_info.items():
@@ -219,15 +281,80 @@ class ReprojectionPlugin(RosBagPluginBase):
                 image_candidates.append(topic_name)
             elif "PointCloud2" in msg_type or "livox" in msg_type or "lidar" in topic_name:
                 lidar_candidates.append(topic_name)
-        return (
-            image_candidates[0] if image_candidates else None,
-            lidar_candidates[0] if lidar_candidates else None,
-        )
+        return image_candidates, lidar_candidates
+
+    def _pick_default_image_topic(self, image_candidates):
+        if not image_candidates:
+            return None
+
+        current_topic = self.context.get_current_topic()
+        if current_topic in image_candidates:
+            return current_topic
+
+        lower_map = {t: t.lower() for t in image_candidates}
+        preferred_patterns = [
+            "/camera/color/image_raw",
+            "/camera/color/image_rect_color",
+            "/camera/rgb/image_raw",
+            "/camera/rgb/image_color",
+            "color/image_raw",
+            "rgb/image_raw",
+        ]
+        for pattern in preferred_patterns:
+            for topic, lower_topic in lower_map.items():
+                if pattern in lower_topic:
+                    return topic
+
+        def is_depth_like(topic_name):
+            n = topic_name.lower()
+            return any(k in n for k in ["depth", "aligned_depth", "infra", "ir/", "_ir", "confidence"])
+
+        non_depth = [t for t in image_candidates if not is_depth_like(t)]
+        if non_depth:
+            return non_depth[0]
+        return image_candidates[0]
+
+    def _pick_default_lidar_topic(self, lidar_candidates):
+        if not lidar_candidates:
+            return None
+
+        current_topic = self.context.get_current_topic()
+        if current_topic in lidar_candidates:
+            return current_topic
+
+        lower_map = {t: t.lower() for t in lidar_candidates}
+        preferred_patterns = [
+            "/lio/clouds_lidar",
+            "/points_raw",
+            "/livox/lidar",
+            "/velodyne_points",
+        ]
+        for pattern in preferred_patterns:
+            for topic, lower_topic in lower_map.items():
+                if pattern in lower_topic:
+                    return topic
+        return lidar_candidates[0]
 
     def on_start(self):
         if self.viewer_window and self.viewer_window.winfo_exists():
             self.viewer_window.lift()
             return
+
+        image_candidates, lidar_candidates = self._collect_candidate_topics()
+        if not image_candidates or not lidar_candidates:
+            messagebox.showwarning("提示", "未检测到完整的图像/点云话题。", parent=self.context.master)
+            return
+
+        topic_dlg = TopicSelectionDialog(
+            self.context.master,
+            image_topics=image_candidates,
+            lidar_topics=lidar_candidates,
+            default_image=self._pick_default_image_topic(image_candidates),
+            default_lidar=self._pick_default_lidar_topic(lidar_candidates),
+        )
+        if topic_dlg.result is None:
+            return
+        img_topic, lidar_topic = topic_dlg.result
 
         # 弹出内外参填写对话框
         dlg = CalibrationDialog(self.context.master)
@@ -235,11 +362,6 @@ class ReprojectionPlugin(RosBagPluginBase):
             return  # 用户取消
 
         _name, K, dist, T_cam_lidar = dlg.result
-
-        img_topic, lidar_topic = self._auto_detect_topics()
-        if not img_topic or not lidar_topic:
-            messagebox.showwarning("提示", "未能自动检测到完整的图像/点云话题。", parent=self.context.master)
-            return
 
         bag_path = self.context.bag_file_path
         self.viewer_window = ReprojectionViewer(self.context.master)
