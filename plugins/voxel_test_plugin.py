@@ -684,9 +684,9 @@ class VoxelTestWindow(ttk.Toplevel):
         threading.Thread(target=self._compute_adaptive_multires_all_frames, daemon=True).start()
 
     def _compute_adaptive_multires_all_frames(self):
-        target_n = 2500
-        alpha = 1.5
-        base_min = 0.02
+        target_n = 1500
+        alpha = 1.2
+        base_min = 0.03
         base_max = 0.8
         total_frames = len(self.index_data)
         counts = [float("nan")] * total_frames
@@ -738,9 +738,9 @@ class VoxelTestWindow(ttk.Toplevel):
         threading.Thread(target=self._compute_adaptive_single_all_frames, daemon=True).start()
 
     def _compute_adaptive_single_all_frames(self):
-        target_n = 2500
-        alpha = 1.5
-        v_min = 0.02
+        target_n = 1500
+        alpha = 1.2
+        v_min = 0.03
         v_max = 0.8
         total_frames = len(self.index_data)
         counts = [float("nan")] * total_frames

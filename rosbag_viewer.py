@@ -26,6 +26,7 @@ from plugin_core import ViewerContext
 from plugins.reprojection_plugin import ReprojectionPlugin
 from plugins.data_plotter_plugin import DataPlotterPlugin
 from plugins.voxel_test_plugin import VoxelTestPlugin
+from plugins.elevator_door_detector_plugin import ElevatorDoorDetectorPlugin
 from plugins.imu_lidar_conflict_plugin import ImuLidarConflictPlugin
 # --- 消息解析辅助函数 (整合版) ---
 
@@ -151,6 +152,7 @@ class RosBagViewer(ttk.Toplevel):
             ReprojectionPlugin(self.context),
             DataPlotterPlugin(self.context),
             VoxelTestPlugin(self.context),
+            # ElevatorDoorDetectorPlugin(self.context),
             # ImuLidarConflictPlugin(self.context)
         ]
 
