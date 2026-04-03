@@ -198,6 +198,133 @@ class ZoomableImagePanel(ttk.Frame):
         self._render_image()
 
 
+class TranslationTunerDialog(tk.Toplevel):
+    """用于微调 T_cam_lidar 平移向量的交互窗口"""
+
+    AXES = ("x", "y", "z")
+
+    def __init__(self, parent, initial_t, on_change, on_close=None):
+        super().__init__(parent)
+        self.title("首帧平移微调")
+        self.resizable(False, False)
+        self.on_change = on_change
+        self._on_close = on_close
+
+        self._vars = {
+            "x": tk.DoubleVar(value=float(initial_t[0])),
+            "y": tk.DoubleVar(value=float(initial_t[1])),
+            "z": tk.DoubleVar(value=float(initial_t[2])),
+        }
+        self._active_axis = tk.StringVar(value="x")
+        self._step_var = tk.DoubleVar(value=0.01)
+
+        self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.bind("<Left>", self._on_arrow_key)
+        self.bind("<Right>", self._on_arrow_key)
+        self.bind("<Up>", self._on_arrow_key)
+        self.bind("<Down>", self._on_arrow_key)
+        self.bind("<Prior>", self._on_z_key)   # PageUp
+        self.bind("<Next>", self._on_z_key)    # PageDown
+        self.focus_force()
+
+    def _build_ui(self):
+        frame = ttk.Frame(self, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frame, text="分析对象：第 1 帧图像 + 点云", bootstyle="secondary").grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(frame, text="方向键：左右微调当前轴；上下切换轴；PageUp/PageDown 微调 Z", bootstyle="secondary").grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        ttk.Label(frame, text="步长(m):").grid(row=2, column=0, sticky="w")
+        step_spin = ttk.Spinbox(frame, from_=0.001, to=0.2, increment=0.001, textvariable=self._step_var, width=8)
+        step_spin.grid(row=2, column=1, sticky="w", pady=(0, 8))
+
+        axis_row = ttk.Frame(frame)
+        axis_row.grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        ttk.Label(axis_row, text="当前轴:").pack(side=tk.LEFT)
+        for axis in self.AXES:
+            ttk.Radiobutton(axis_row, text=axis.upper(), variable=self._active_axis, value=axis).pack(side=tk.LEFT, padx=(6, 0))
+
+        self._scales = {}
+        for i, axis in enumerate(self.AXES):
+            base = float(self._vars[axis].get())
+            span = max(1.0, abs(base) + 0.5)
+            ttk.Label(frame, text=f"t{axis} (m)").grid(row=4 + i, column=0, sticky="w")
+            scale = tk.Scale(
+                frame,
+                from_=base - span,
+                to=base + span,
+                orient=tk.HORIZONTAL,
+                resolution=0.001,
+                length=360,
+                variable=self._vars[axis],
+                command=lambda _val, a=axis: self._on_slider_changed(a),
+            )
+            scale.grid(row=4 + i, column=1, columnspan=2, sticky="ew", pady=(0, 4))
+            self._scales[axis] = scale
+
+        btn_row = ttk.Frame(frame)
+        btn_row.grid(row=7, column=0, columnspan=3, sticky="e", pady=(8, 0))
+        ttk.Button(btn_row, text="恢复初值", command=self._reset_values, bootstyle="warning-outline").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btn_row, text="关闭", command=self._close, bootstyle="secondary").pack(side=tk.LEFT)
+
+        frame.columnconfigure(1, weight=1)
+        self._emit_change()
+
+    def _get_vector(self):
+        return np.array([self._vars["x"].get(), self._vars["y"].get(), self._vars["z"].get()], dtype=np.float64)
+
+    def _emit_change(self):
+        if callable(self.on_change):
+            self.on_change(self._get_vector())
+
+    def _on_slider_changed(self, axis):
+        self._active_axis.set(axis)
+        self._emit_change()
+
+    def _nudge_axis(self, axis, delta):
+        v = float(self._vars[axis].get()) + float(delta)
+        scale = self._scales[axis]
+        v = min(max(v, float(scale.cget("from"))), float(scale.cget("to")))
+        self._vars[axis].set(v)
+        self._emit_change()
+
+    def _on_arrow_key(self, event):
+        axis = self._active_axis.get()
+        step = max(0.001, float(self._step_var.get()))
+        if event.keysym == "Left":
+            self._nudge_axis(axis, -step)
+        elif event.keysym == "Right":
+            self._nudge_axis(axis, step)
+        elif event.keysym == "Up":
+            idx = (self.AXES.index(axis) - 1) % len(self.AXES)
+            self._active_axis.set(self.AXES[idx])
+        elif event.keysym == "Down":
+            idx = (self.AXES.index(axis) + 1) % len(self.AXES)
+            self._active_axis.set(self.AXES[idx])
+        return "break"
+
+    def _on_z_key(self, event):
+        step = max(0.001, float(self._step_var.get()))
+        if event.keysym == "Prior":
+            self._nudge_axis("z", step)
+        elif event.keysym == "Next":
+            self._nudge_axis("z", -step)
+        return "break"
+
+    def _reset_values(self):
+        for axis in self.AXES:
+            scale = self._scales[axis]
+            center = (float(scale.cget("from")) + float(scale.cget("to"))) * 0.5
+            self._vars[axis].set(center)
+        self._emit_change()
+
+    def _close(self):
+        if callable(self._on_close):
+            self._on_close()
+        self.destroy()
+
+
 class ReprojectionViewer(ttk.Toplevel):
     """
     一个用于可视化3D点云到2D图像反投影的GUI类。
@@ -234,6 +361,9 @@ class ReprojectionViewer(ttk.Toplevel):
         self._frame_label = None
         self._total_frames = 0
         self._is_dragging = False
+        self.translation_tune_button = None
+        self.translation_tuner_window = None
+        self._tune_frame_index = 0
 
         self._create_widgets()
 
@@ -296,6 +426,14 @@ class ReprojectionViewer(ttk.Toplevel):
             bootstyle="success"
         )
         self.export_button.pack(side=tk.RIGHT, padx=(0, 4))
+
+        self.translation_tune_button = ttk.Button(
+            self.reprojection_controls,
+            text="首帧平移微调",
+            command=self._open_translation_tuner,
+            bootstyle="info-outline"
+        )
+        self.translation_tune_button.pack(side=tk.RIGHT, padx=(0, 4))
 
         # 相机帧偏移量
         ttk.Label(self.reprojection_controls, text="相机偏移:").pack(side=tk.RIGHT, padx=(8, 2))
@@ -368,6 +506,43 @@ class ReprojectionViewer(ttk.Toplevel):
     def _on_offset_changed(self):
         index = int(self._slider_var.get())
         self.update_view_by_index(index, high_quality=True)
+
+    def _open_translation_tuner(self):
+        if not (self.image_reader and self.lidar_reader):
+            messagebox.showwarning("提示", "请先完成数据源配置再进行平移微调。", parent=self)
+            return
+
+        self._tune_frame_index = 0
+        self._slider_var.set(self._tune_frame_index)
+        self._frame_label.config(text=f"{self._tune_frame_index + 1} / {self._total_frames}")
+        self.update_view_by_index(self._tune_frame_index, high_quality=True)
+
+        if self.translation_tuner_window and self.translation_tuner_window.winfo_exists():
+            self.translation_tuner_window.lift()
+            self.translation_tuner_window.focus_force()
+            return
+
+        initial_t = self.T_cam_lidar[:3, 3].copy()
+        self.translation_tuner_window = TranslationTunerDialog(
+            self,
+            initial_t=initial_t,
+            on_change=self._on_translation_tuner_changed,
+            on_close=self._on_translation_tuner_closed,
+        )
+
+    def _on_translation_tuner_changed(self, tvec):
+        self.T_cam_lidar[:3, 3] = np.asarray(tvec, dtype=np.float64)
+        self.update_view_by_index(self._tune_frame_index, high_quality=True)
+
+    def _on_translation_tuner_closed(self):
+        self.translation_tuner_window = None
+        self._print_current_extrinsics()
+
+    def _print_current_extrinsics(self):
+        print("[平移微调] 当前外参 T_cam_lidar (4x4):")
+        print(np.array2string(self.T_cam_lidar, precision=6, suppress_small=True))
+        tx, ty, tz = self.T_cam_lidar[:3, 3]
+        print(f"[平移微调] t_cam_lidar: tx={tx:.6f}, ty={ty:.6f}, tz={tz:.6f}")
 
     def _show_context_menu(self, event):
         self._context_menu.post(event.x_root, event.y_root)
