@@ -26,6 +26,136 @@ import threading
 import queue
 import multiprocessing
 
+
+def message_timestamp_seconds(message, fallback_timestamp) -> float:
+    """优先使用消息头时间戳，缺失时退回 bag 记录时间。"""
+    header = getattr(message, "header", None)
+    header_stamp = getattr(header, "stamp", None)
+    for timestamp in (header_stamp, fallback_timestamp):
+        if timestamp is None:
+            continue
+        try:
+            seconds = float(timestamp.to_sec())
+        except (AttributeError, TypeError, ValueError):
+            try:
+                seconds = float(timestamp)
+            except (TypeError, ValueError):
+                continue
+        if np.isfinite(seconds) and (timestamp is fallback_timestamp or seconds > 0.0):
+            return seconds
+    raise ValueError("消息中没有有效时间戳")
+
+
+def extract_xyz_points(message) -> np.ndarray:
+    """将常见点云消息统一转换为 N x 3 的 float32 数组。"""
+    if hasattr(message, "points"):
+        points = np.asarray(
+            [[point.x, point.y, point.z] for point in message.points],
+            dtype=np.float32,
+        )
+    elif getattr(message, "_type", "") == "sensor_msgs/PointCloud2":
+        import sensor_msgs.point_cloud2 as pc2
+
+        points = np.asarray(
+            list(pc2.read_points(message, field_names=("x", "y", "z"), skip_nans=True)),
+            dtype=np.float32,
+        )
+    else:
+        raise TypeError(f"不支持的点云消息类型: {getattr(message, '_type', type(message).__name__)}")
+
+    if points.size == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    points = points.reshape(-1, 3)
+    return points[np.all(np.isfinite(points), axis=1)]
+
+
+def project_points_near_image_fov(
+        points_lidar: np.ndarray,
+        T_cam_lidar: np.ndarray,
+        K: np.ndarray,
+        dist_coeffs: np.ndarray,
+        image_shape,
+        fov_margin_ratio: float = 0.1,
+        min_depth: float = 0.2,
+        max_depth: float = 200.0,
+):
+    """先按无畸变视野筛选点，再施加镜头畸变并裁剪到画布。"""
+    points = np.asarray(points_lidar, dtype=np.float32).reshape(-1, 3)
+    if len(points) == 0:
+        empty = np.empty(0, dtype=np.float32)
+        return empty, empty, empty
+
+    transform = np.asarray(T_cam_lidar, dtype=np.float32).reshape(4, 4)
+    camera_matrix = np.asarray(K, dtype=np.float32).reshape(3, 3)
+    distortion = np.asarray(dist_coeffs, dtype=np.float32)
+    points_camera = (
+        transform[:3, :3] @ points.T
+    ).T + transform[:3, 3]
+    depth = points_camera[:, 2]
+
+    depth_mask = (
+        np.isfinite(depth)
+        & (depth > min_depth)
+        & (depth < max_depth)
+    )
+    if not np.any(depth_mask):
+        empty = np.empty(0, dtype=np.float32)
+        return empty, empty, empty
+
+    points_camera = points_camera[depth_mask]
+    depth = depth[depth_mask]
+
+    # 针孔投影只用于畸变前的视锥筛选，不能在此处加入畸变系数。
+    normalized = points_camera / depth[:, None]
+    undistorted_h = (camera_matrix @ normalized.T).T
+    valid_scale = np.abs(undistorted_h[:, 2]) > 1e-8
+    undistorted_u = np.full(len(depth), np.nan, dtype=np.float32)
+    undistorted_v = np.full(len(depth), np.nan, dtype=np.float32)
+    undistorted_u[valid_scale] = (
+        undistorted_h[valid_scale, 0] / undistorted_h[valid_scale, 2]
+    )
+    undistorted_v[valid_scale] = (
+        undistorted_h[valid_scale, 1] / undistorted_h[valid_scale, 2]
+    )
+
+    height, width = image_shape[:2]
+    margin_x = width * fov_margin_ratio
+    margin_y = height * fov_margin_ratio
+    near_fov_mask = (
+        valid_scale
+        & (undistorted_u >= -margin_x)
+        & (undistorted_u < width + margin_x)
+        & (undistorted_v >= -margin_y)
+        & (undistorted_v < height + margin_y)
+    )
+    if not np.any(near_fov_mask):
+        empty = np.empty(0, dtype=np.float32)
+        return empty, empty, empty
+
+    points_camera = points_camera[near_fov_mask]
+    depth = depth[near_fov_mask]
+
+    # 候选点已经位于视野邻域，此时才施加镜头畸变。
+    projected, _ = cv2.projectPoints(
+        points_camera,
+        np.zeros(3, dtype=np.float32),
+        np.zeros(3, dtype=np.float32),
+        camera_matrix,
+        distortion,
+    )
+    projected = projected.reshape(-1, 2)
+    u, v = projected[:, 0], projected[:, 1]
+    canvas_mask = (
+        np.isfinite(u)
+        & np.isfinite(v)
+        & (u >= 0)
+        & (u < width)
+        & (v >= 0)
+        & (v < height)
+    )
+    return u[canvas_mask], v[canvas_mask], depth[canvas_mask]
+
+
 # --- [新增] 独立的、用于并行处理的单帧渲染函数 ---
 def render_single_frame(args):
     """
@@ -55,7 +185,7 @@ def render_single_frame(args):
             cv_image = bridge.imgmsg_to_cv2(image_msg, desired_encoding="bgr8")
 
         lidar_msg, _ = lidar_reader.get_message(index)
-        points_lidar = np.array([[p.x, p.y, p.z] for p in lidar_msg.points])
+        points_lidar = extract_xyz_points(lidar_msg)
 
         # 4. 执行反投影渲染 (这部分逻辑与原 _update_reprojection 完全相同)
         reprojection_img = cv_image.copy()
@@ -63,21 +193,18 @@ def render_single_frame(args):
             return index, reprojection_img  # 返回索引和图像
 
         # ... (这里省略了您原有的、完整的反投影计算代码，直接复制粘贴即可) ...
-        h, w = cv_image.shape[:2]
-        R_cam_lidar = T_cam_lidar[:3, :3].astype(np.float32)
-        t_cam_lidar = T_cam_lidar[:3, 3].astype(np.float32)
-        rvec, _ = cv2.Rodrigues(R_cam_lidar)
-        pts = points_lidar.astype(np.float32)
-        proj, _ = cv2.projectPoints(pts, rvec, t_cam_lidar, K.astype(np.float32), dist_coeffs.astype(np.float32))
-        proj = proj.reshape(-1, 2)
-        pts_cam = (R_cam_lidar @ pts.T).T + t_cam_lidar
-        depth = pts_cam[:, 2]
         min_z, max_z = 0.2, 200.0
-        u, v = proj[:, 0], proj[:, 1]
-        mask = (depth > min_z) & (depth < max_z) & (u >= 0) & (u < w) & (v >= 0) & (v < h)
-        if not np.any(mask):
+        u, v, z = project_points_near_image_fov(
+            points_lidar,
+            T_cam_lidar,
+            K,
+            dist_coeffs,
+            cv_image.shape,
+            min_depth=min_z,
+            max_depth=max_z,
+        )
+        if len(z) == 0:
             return index, reprojection_img
-        u, v, z = u[mask], v[mask], depth[mask]
         order = np.argsort(z)
         u, v, z = u[order], v[order], z[order]
         z_pos = z[z > 0]
@@ -364,6 +491,7 @@ class ReprojectionViewer(ttk.Toplevel):
         self.translation_tune_button = None
         self.translation_tuner_window = None
         self._tune_frame_index = 0
+        self._image_timestamp_cache = {}
 
         self._create_widgets()
 
@@ -466,12 +594,18 @@ class ReprojectionViewer(ttk.Toplevel):
             self.K = K
             self.dist_coeffs = dist_coeffs
             self.T_cam_lidar = T_cam_lidar
+            self._image_timestamp_cache.clear()
 
-            # 设置滚动条范围
-            self._total_frames = self.image_reader.get_message_count()
+            # 以 LiDAR 帧为时间轴，再为每帧匹配时间上最近的相机帧。
+            self._total_frames = self.lidar_reader.get_message_count()
             if self._total_frames > 0:
                 self._slider.config(from_=0, to=self._total_frames - 1)
+                self._slider_var.set(0)
                 self._frame_label.config(text=f"1 / {self._total_frames}")
+            else:
+                self._slider.config(from_=0, to=0)
+                self._slider_var.set(0)
+                self._frame_label.config(text="0 / 0")
 
             print("数据源配置成功！")
         except Exception as e:
@@ -600,6 +734,39 @@ class ReprojectionViewer(ttk.Toplevel):
         cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         return cv_image
 
+    def _get_image_timestamp_seconds(self, index: int) -> float:
+        cached = self._image_timestamp_cache.get(index)
+        if cached is not None:
+            return cached
+        image_msg, bag_timestamp = self.image_reader.get_message(index)
+        timestamp = message_timestamp_seconds(image_msg, bag_timestamp)
+        self._image_timestamp_cache[index] = timestamp
+        return timestamp
+
+    def _find_nearest_image_index(self, target_timestamp: float) -> int:
+        """在按时间排列的图像消息中二分查找最近帧。"""
+        image_count = self.image_reader.get_message_count()
+        if image_count == 0:
+            raise IndexError("图像话题中没有消息")
+
+        low, high = 0, image_count
+        while low < high:
+            middle = (low + high) // 2
+            if self._get_image_timestamp_seconds(middle) < target_timestamp:
+                low = middle + 1
+            else:
+                high = middle
+
+        candidates = [min(low, image_count - 1)]
+        if low > 0:
+            candidates.append(low - 1)
+        return min(
+            candidates,
+            key=lambda candidate: abs(
+                self._get_image_timestamp_seconds(candidate) - target_timestamp
+            ),
+        )
+
     def update_view_by_index(self, index: int, high_quality: bool = True) -> Optional[np.ndarray]:
         """根据给定的消息索引，刷新所有视图，并返回生成的反投影图像"""
         if not (self.image_reader and self.lidar_reader):
@@ -609,25 +776,28 @@ class ReprojectionViewer(ttk.Toplevel):
         try:
             offset = self._offset_var.get() if hasattr(self, '_offset_var') else 0
             img_count = self.image_reader.get_message_count()
-            image_index = max(0, min(img_count - 1, index + offset))
 
-            image_msg, img_ts = self.image_reader.get_message(image_index)
+            lidar_msg, lidar_bag_ts = self.lidar_reader.get_message(index)
+            lidar_ts = message_timestamp_seconds(lidar_msg, lidar_bag_ts)
+            matched_image_index = self._find_nearest_image_index(lidar_ts)
+            image_index = max(0, min(img_count - 1, matched_image_index + offset))
+
+            image_msg, image_bag_ts = self.image_reader.get_message(image_index)
+            image_ts = message_timestamp_seconds(image_msg, image_bag_ts)
             if image_msg._type == 'sensor_msgs/CompressedImage':
                 cv_image = self.compressed_img_to_cv2(image_msg)
             else:
                 cv_image = self.image_reader.bridge.imgmsg_to_cv2(image_msg, desired_encoding="bgr8")
 
-            lidar_msg, lidar_ts = self.lidar_reader.get_message(index)
-            points_lidar = np.array([[p.x, p.y, p.z] for p in lidar_msg.points])
+            points_lidar = extract_xyz_points(lidar_msg)
 
             # 更新时间戳显示
-            def fmt_ts(ts):
-                try:
-                    return f"{ts.to_sec():.6f}s"
-                except Exception:
-                    return str(ts)
             self._ts_label.config(
-                text=f"相机(+{offset}帧): {fmt_ts(img_ts)}  |  LiDAR: {fmt_ts(lidar_ts)}  |  差值: {(img_ts - lidar_ts).to_sec()*1000:.1f}ms"
+                text=(
+                    f"相机[{image_index + 1}]({offset:+d}帧): {image_ts:.6f}s  |  "
+                    f"LiDAR[{index + 1}]: {lidar_ts:.6f}s  |  "
+                    f"差值: {(image_ts - lidar_ts) * 1000:.1f}ms"
+                )
             )
 
             # 更新所有面板，并捕获返回的反投影图像
@@ -662,29 +832,22 @@ class ReprojectionViewer(ttk.Toplevel):
             self.reprojection_panel.set_image(reprojection_img);
             return
 
-        h, w = image.shape[:2]
-
-        # --- 1. 投影 (保持不变) ---
-        R_cam_lidar = self.T_cam_lidar[:3, :3].astype(np.float32)
-        t_cam_lidar = self.T_cam_lidar[:3, 3].astype(np.float32)
+        # --- 1. 先按无畸变视野筛选，再对候选点施加畸变 ---
         K = self.K.astype(np.float32);
         dist = self.dist_coeffs.astype(np.float32)
-        rvec, _ = cv2.Rodrigues(R_cam_lidar)
-        pts = points_lidar.astype(np.float32)
-        proj, _ = cv2.projectPoints(pts, rvec, t_cam_lidar, K, dist)
-        proj = proj.reshape(-1, 2)
-        pts_cam = (R_cam_lidar @ pts.T).T + t_cam_lidar
-        depth = pts_cam[:, 2]
-
         min_z, max_z = 0.2, 200.0
-        u, v = proj[:, 0], proj[:, 1]
-        mask = (depth > min_z) & (depth < max_z) & (u >= 0) & (u < w) & (v >= 0) & (v < h)
-
-        if not np.any(mask):
+        u, v, z = project_points_near_image_fov(
+            points_lidar,
+            self.T_cam_lidar,
+            K,
+            dist,
+            image.shape,
+            min_depth=min_z,
+            max_depth=max_z,
+        )
+        if len(z) == 0:
             self.reprojection_panel.set_image(reprojection_img);
             return
-
-        u, v, z = u[mask], v[mask], depth[mask]
 
         # --- 2. 深度排序: 近点在前，远的在后，方便后续绘制 ---
         order = np.argsort(z)  # z越小(越近)的索引在前
